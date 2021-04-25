@@ -133,6 +133,7 @@ class RSAN(nn.Module):
         dropout=0,
         bidirectional=True,
         spk_emb_dim=128,
+        block_size=80,
     ):
 
         self.module = RSAN_module(
@@ -145,7 +146,88 @@ class RSAN(nn.Module):
             spk_emb_dim=spk_emb_dim
         )
 
+        self.spk_emb_dim = spk_emb_dim
+
+        self.block_size = block_size
+
+        self.threshold_res = 0.1
+
     def forward(self, spec, spat):
+        # spec: [N, F, T]
+        # spat: [N, F, T]
+        N, F, T = spec.shape
+
+        n_block = T//self.block_size
+        if T - n_block*self.block_size > self.block_size/2:
+            n_block = n_block + 1
+
+        list_spk_info = []
+        noise_info = torch.zeros(self.spk_emb_dim)
+        list_spk_info.append([noise_info])
+
+        list_spk_mask = []
+
+        res_mask_all = None
+
+        for i_block in range(n_block):
+            if i_block == n_block - 1:
+                spec_block = spec[:, :, i_block*self.block_size:]
+                spat_block = spat[:, :, i_block*self.block_size:]
+            else:
+                spec_block = spec[:, :, i_block*self.block_size:(i_block+1)*self.block_size]
+                spat_block = spat[:, :, i_block*self.block_size:(i_block+1)*self.block_size]
+
+            _, _, T_block = spec_block.shape
+            res_mask = torch.one((N, F, T_block))
+            
+            result = self.module(spec_block, spat_block, res_mask, list_spk_info[0][-1])
+
+            res_mask = result['res_mask']
+            noise_mask = result['est_mask']
+            noise_info = result['spk_info']
+            list_spk_info[0].append(noise_info)
+
+            if i_block == 0:
+                list_spk_mask.append(noise_mask)
+            else:
+                list_spk_mask[0] = torch.cat([list_spk_mask[0], noise_mask], axis=-1)
+
+            value_res_mask = torch.mean(res_mask)
+
+            i_spk = 1
+            while value_res_mask > self.threshold_res:
+                # add a new speaker
+                if i_spk == len(list_spk_info):
+                    list_spk_info.append([torch.zeros(self.spk_emb_dim)])
+                    list_spk_mask.append(torch.zeros((N, F, i_block*self.block_size)))
+
+                result = self.module(spec_block, spat_block, res_mask, list_spk_info[i_spk][-1])
+
+                res_mask = result['res_mask']
+                spk_mask = result['est_mask']
+                spk_info = result['spk_info']
+
+                list_spk_info[i_spk].append(spk_info)
+
+                list_spk_mask[i_spk] = torch.cat([list_spk_mask[i_spk], noise_mask], axis=-1)
+
+                i_spk += 1
+
+            if res_mask_all is None:
+                res_mask_all = res_mask
+            else:
+                res_mask_all = torch.cat([res_mask_all, res_mask], axis=-1)
+
+        for i_mask, mask in enumerate(list_spk_mask):
+            list_spk_mask[i_mask] = mask * spec
+
+        result = {
+            'spec_spk': list_spk_mask,
+            'res_mask': res_mask_all,
+            'spk_emb': list_spk_info,
+        }
+
+        return result
 
 
 class Chimera(nn.Module):
@@ -296,3 +378,17 @@ def load_best_model(train_conf, exp_dir):
     model = torch_utils.load_state_dict_in(checkpoint["state_dict"], model)
     model.eval()
     return model
+
+
+def test_nnet():
+    net = RSAN(8)
+    x_spec = th.randn([3, 1, 257, 300])
+    x_spat = th.randn([3, 1, 257, 300])
+    est = net(x_spec, x_spat)
+    print('est["spec_spk"].shape: ', est["spec_spk"].shape)
+    print('est["res_mask"].shape: ', est["res_mask"].shape)
+    print('est["spk_emb"].shape: ', est["spk_emb"].shape)
+
+if __name__ == "__main__":
+    test_nnet()
+
