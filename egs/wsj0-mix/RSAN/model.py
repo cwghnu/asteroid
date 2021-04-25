@@ -28,6 +28,125 @@ def make_model_and_optimizer(conf):
     optimizer = make_optimizer(model.parameters(), **conf["optim"])
     return model, optimizer
 
+class RSAN_module(nn.Module):
+    def __init__(
+        self,
+        in_chan,
+        n_bin=257,
+        n_layers=2,
+        hidden_size=600,
+        dropout=0,
+        bidirectional=True,
+        spk_emb_dim=128,
+    ):
+        super().__init__()
+
+        self.lstm = nn.LSTM(
+            in_chan,
+            hidden_size,
+            num_layers=n_layers,
+            dropout=dropout,
+            batch_first=True,
+            bidirectional=bool(bidirectional),
+        )
+
+        self.spk_emb_dim = spk_emb_dim
+
+        self.fc_lstm = nn.Sequential(
+            nn.Linear(hidden_size*2, spk_emb_dim),
+            nn.Sigmoid()
+        )
+
+        self.fc_adpt = nn.Sequential(
+            nn.Linear(spk_emb_dim, spk_emb_dim),
+            nn.Sigmoid()
+        )
+
+        self.fc_mask = nn.Sequential(
+            nn.Linear(spk_emb_dim, n_bin),
+            nn.Sigmoid()
+        )
+
+        self.fc_gate = nn.Sequential(
+            nn.Linear(spk_emb_dim, spk_emb_dim),
+            nn.Sigmoid()
+        )
+
+        self.fc_emb = nn.Sequential(
+            nn.Linear(spk_emb_dim, 50),
+            nn.Linear(50, 50),
+            nn.Linear(50, spk_emb_dim),
+            nn.Sigmoid()
+        )
+
+        self.fc_affine = nn.Linear(spk_emb_dim, spk_emb_dim, bias=False)
+
+    
+    def forward(self, spec, spat, res_mask, spk_info):
+        # spec: [N, F, T]
+        # spat: [N, F, T]
+        # res_mask: [N, F, T]
+        # spk_info: [spk_emb_dim]
+
+        N, F, T = spec.shape
+
+        spec = spec.permute(0, 2, 1)
+        spat = spat.permute(0, 2, 1)
+        res_mask = res_mask.permute(0, 2, 1)
+
+        input_lstm = torch.cat([spec, spat, res_mask], axis=2)  # [N, T, F*3]
+
+        output_lstm = self.lstm(input_lstm) # [N, T, hidden_size*2]
+        output_lstm = self.fc_lstm(output_lstm) # [N, T, spk_emb_dim]
+
+        speech_info = self.fc_adpt(spk_info) # [spk_emb_dim]
+        speech_info = output_lstm * speech_info # [N, T, spk_emb_dim]
+
+        out_spk_mask = self.fc_mask(speech_info)
+        out_res_mask = torch.clamp(res_mask - out_spk_mask, 0, 1)
+
+        spk_emb = self.fc_emb(speech_info)  # [N, T, spk_emb_dim]
+        spk_emb = torch.mean(spk_emb)   # [N, spk_emb_dim]
+        spk_emb = self.fc_affine(spk_emb)   # [N, spk_emb_dim]
+        
+        weight_gate = self.fc_gate(speech_info) # [N, T, spk_emb_dim]
+        weight_gate = torch.mean(weight_gate, axis=1)   # [N, spk_emb_dim]
+        
+        out_emb = weight_gate * spk_emb + spk_info  # [N, spk_emb_dim]
+        out_emb = torch.norm(out_emb, p=2, dim=1)
+
+        out = {
+            "est_mask": out_spk_mask,
+            "res_mask": out_res_mask,
+            "spk_info": out_emb
+        }
+
+        return out
+
+class RSAN(nn.Module):
+    def __init__(
+        self,
+        in_chan,
+        n_bin=257,
+        n_layers=2,
+        hidden_size=600,
+        dropout=0,
+        bidirectional=True,
+        spk_emb_dim=128,
+    ):
+
+        self.module = RSAN_module(
+            in_chan,
+            n_bin=n_bin,
+            n_layers=n_layers,
+            hidden_size=hidden_size,
+            dropout=dropout,
+            bidirectional=bidirectional,
+            spk_emb_dim=spk_emb_dim
+        )
+
+    def forward(self, spec, spat):
+
 
 class Chimera(nn.Module):
     def __init__(
