@@ -31,7 +31,7 @@ def make_model_and_optimizer(conf):
 class RSAN_module(nn.Module):
     def __init__(
         self,
-        in_chan,
+        in_spat=257,
         n_bin=257,
         n_layers=2,
         hidden_size=600,
@@ -42,7 +42,7 @@ class RSAN_module(nn.Module):
         super().__init__()
 
         self.lstm = nn.LSTM(
-            in_chan,
+            n_bin*2+in_spat,
             hidden_size,
             num_layers=n_layers,
             dropout=dropout,
@@ -90,30 +90,33 @@ class RSAN_module(nn.Module):
 
         N, F, T = spec.shape
 
-        spec = spec.permute(0, 2, 1)
-        spat = spat.permute(0, 2, 1)
-        res_mask = res_mask.permute(0, 2, 1)
+        spec = spec.permute(0, 2, 1).contiguous()
+        spat = spat.permute(0, 2, 1).contiguous()
+        res_mask = res_mask.permute(0, 2, 1).contiguous()
 
         input_lstm = torch.cat([spec, spat, res_mask], axis=2)  # [N, T, F*3]
 
-        output_lstm = self.lstm(input_lstm) # [N, T, hidden_size*2]
+        output_lstm, _ = self.lstm(input_lstm) # [N, T, hidden_size*2]
         output_lstm = self.fc_lstm(output_lstm) # [N, T, spk_emb_dim]
 
         speech_info = self.fc_adpt(spk_info) # [spk_emb_dim]
-        speech_info = output_lstm * speech_info # [N, T, spk_emb_dim]
+        speech_info = output_lstm * speech_info.unsqueeze(1) # [N, T, spk_emb_dim]
 
         out_spk_mask = self.fc_mask(speech_info)
         out_res_mask = torch.clamp(res_mask - out_spk_mask, 0, 1)
 
         spk_emb = self.fc_emb(speech_info)  # [N, T, spk_emb_dim]
-        spk_emb = torch.mean(spk_emb)   # [N, spk_emb_dim]
+        spk_emb = torch.mean(spk_emb, axis=1)   # [N, spk_emb_dim]
         spk_emb = self.fc_affine(spk_emb)   # [N, spk_emb_dim]
         
         weight_gate = self.fc_gate(speech_info) # [N, T, spk_emb_dim]
         weight_gate = torch.mean(weight_gate, axis=1)   # [N, spk_emb_dim]
         
         out_emb = weight_gate * spk_emb + spk_info  # [N, spk_emb_dim]
-        out_emb = torch.norm(out_emb, p=2, dim=1)
+        out_emb = out_emb / torch.norm(out_emb, p=2, dim=1, keepdim=True)
+
+        out_res_mask = out_res_mask.permute(0, 2, 1).contiguous()   # [N, F, T]
+        out_spk_mask = out_spk_mask.permute(0, 2, 1).contiguous()
 
         out = {
             "est_mask": out_spk_mask,
@@ -126,7 +129,7 @@ class RSAN_module(nn.Module):
 class RSAN(nn.Module):
     def __init__(
         self,
-        in_chan,
+        in_spat=257,
         n_bin=257,
         n_layers=2,
         hidden_size=600,
@@ -135,9 +138,10 @@ class RSAN(nn.Module):
         spk_emb_dim=128,
         block_size=80,
     ):
+        super().__init__()
 
         self.module = RSAN_module(
-            in_chan,
+            in_spat=in_spat,
             n_bin=n_bin,
             n_layers=n_layers,
             hidden_size=hidden_size,
@@ -150,7 +154,7 @@ class RSAN(nn.Module):
 
         self.block_size = block_size
 
-        self.threshold_res = 0.1
+        self.threshold_res = 0.5
 
     def forward(self, spec, spat):
         # spec: [N, F, T]
@@ -162,7 +166,7 @@ class RSAN(nn.Module):
             n_block = n_block + 1
 
         list_spk_info = []
-        noise_info = torch.zeros(self.spk_emb_dim)
+        noise_info = torch.zeros([N, self.spk_emb_dim]).cuda()
         list_spk_info.append([noise_info])
 
         list_spk_mask = []
@@ -178,7 +182,7 @@ class RSAN(nn.Module):
                 spat_block = spat[:, :, i_block*self.block_size:(i_block+1)*self.block_size]
 
             _, _, T_block = spec_block.shape
-            res_mask = torch.one((N, F, T_block))
+            res_mask = torch.ones([N, F, T_block]).cuda()
             
             result = self.module(spec_block, spat_block, res_mask, list_spk_info[0][-1])
 
@@ -198,8 +202,8 @@ class RSAN(nn.Module):
             while value_res_mask > self.threshold_res:
                 # add a new speaker
                 if i_spk == len(list_spk_info):
-                    list_spk_info.append([torch.zeros(self.spk_emb_dim)])
-                    list_spk_mask.append(torch.zeros((N, F, i_block*self.block_size)))
+                    list_spk_info.append([torch.zeros([N, self.spk_emb_dim]).cuda()])
+                    list_spk_mask.append(torch.zeros((N, F, i_block*self.block_size)).cuda())
 
                 result = self.module(spec_block, spat_block, res_mask, list_spk_info[i_spk][-1])
 
@@ -209,7 +213,7 @@ class RSAN(nn.Module):
 
                 list_spk_info[i_spk].append(spk_info)
 
-                list_spk_mask[i_spk] = torch.cat([list_spk_mask[i_spk], noise_mask], axis=-1)
+                list_spk_mask[i_spk] = torch.cat([list_spk_mask[i_spk], spk_mask], axis=-1)
 
                 i_spk += 1
 
@@ -381,13 +385,23 @@ def load_best_model(train_conf, exp_dir):
 
 
 def test_nnet():
-    net = RSAN(8)
-    x_spec = th.randn([3, 1, 257, 300])
-    x_spat = th.randn([3, 1, 257, 300])
-    est = net(x_spec, x_spat)
-    print('est["spec_spk"].shape: ', est["spec_spk"].shape)
+    net = RSAN(block_size=30)
+    x_spec = torch.randn([3, 257, 300])
+    x_spat = torch.randn([3, 257, 300])
+
+    test_cuda = True
+
+    if test_cuda:
+        x_spec = x_spec.cuda()
+        x_spat = x_spat.cuda()
+        gpus = [0]
+        est = nn.parallel.data_parallel(net.cuda(), (x_spec, x_spat), gpus, gpus[0])
+    else:
+        est = net(x_spec, x_spat)
+
+    print('est["spec_spk"].shape: ', est["spec_spk"][0].shape)
     print('est["res_mask"].shape: ', est["res_mask"].shape)
-    print('est["spk_emb"].shape: ', est["spk_emb"].shape)
+    print('est["spk_emb"].shape: ', est["spk_emb"][0][0].shape)
 
 if __name__ == "__main__":
     test_nnet()
