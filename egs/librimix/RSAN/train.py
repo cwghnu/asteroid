@@ -1,46 +1,81 @@
 import os
 import argparse
 import json
+
 import torch
-from torch import nn
 from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.utils.data import DataLoader
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
 
+from asteroid.models import DCCRNet
+from asteroid.data import LibriMix
+from asteroid.engine.optimizers import make_optimizer
 from asteroid.engine.system import System
-from asteroid.losses import PITLossWrapper, pairwise_mse
-from asteroid.losses import deep_clustering_loss
-from asteroid_filterbanks.transforms import mag
-from asteroid.dsp.vad import ebased_vad
+from asteroid.losses import PITLossWrapper, pairwise_neg_sisdr
 
-from asteroid.data.wsj0_mix import make_dataloaders
-from model import make_model_and_optimizer
+# Keys which are not in the conf.yml file can be added here.
+# In the hierarchical dictionary created when parsing, the key `key` can be
+# found at dic['main_args'][key]
 
+# By default train.py will use all available GPUs. The `id` option in run.sh
+# will limit the number of available GPUs for train.py .
 parser = argparse.ArgumentParser()
 parser.add_argument("--exp_dir", default="exp/tmp", help="Full path to save best validation model")
 
 
 def main(conf):
-    exp_dir = conf["main_args"]["exp_dir"]
-    # Define Dataloader
-    train_loader, val_loader = make_dataloaders(**conf["data"], **conf["training"])
+    train_set = LibriMix(
+        csv_dir=conf["data"]["train_dir"],
+        task=conf["data"]["task"],
+        sample_rate=conf["data"]["sample_rate"],
+        n_src=conf["data"]["n_src"],
+        segment=conf["data"]["segment"],
+    )
+
+    val_set = LibriMix(
+        csv_dir=conf["data"]["valid_dir"],
+        task=conf["data"]["task"],
+        sample_rate=conf["data"]["sample_rate"],
+        n_src=conf["data"]["n_src"],
+        segment=conf["data"]["segment"],
+    )
+
+    train_loader = DataLoader(
+        train_set,
+        shuffle=True,
+        batch_size=conf["training"]["batch_size"],
+        num_workers=conf["training"]["num_workers"],
+        drop_last=True,
+    )
+
+    val_loader = DataLoader(
+        val_set,
+        shuffle=False,
+        batch_size=conf["training"]["batch_size"],
+        num_workers=conf["training"]["num_workers"],
+        drop_last=True,
+    )
     conf["masknet"].update({"n_src": conf["data"]["n_src"]})
-    # Define model, optimizer + scheduler
-    model, optimizer = make_model_and_optimizer(conf)
+
+    model = DCCRNet(
+        **conf["filterbank"], **conf["masknet"], sample_rate=conf["data"]["sample_rate"]
+    )
+    optimizer = make_optimizer(model.parameters(), **conf["optim"])
+    # Define scheduler
     scheduler = None
     if conf["training"]["half_lr"]:
         scheduler = ReduceLROnPlateau(optimizer=optimizer, factor=0.5, patience=5)
-
-    # Save config
+    # Just after instantiating, save the args. Easy loading in the future.
+    exp_dir = conf["main_args"]["exp_dir"]
     os.makedirs(exp_dir, exist_ok=True)
     conf_path = os.path.join(exp_dir, "conf.yml")
     with open(conf_path, "w") as outfile:
         yaml.safe_dump(conf, outfile)
 
-    # Define loss function
-    loss_func = ChimeraLoss(alpha=conf["training"]["loss_alpha"])
-    # Put together in System
-    system = ChimeraSystem(
+    # Define Loss function.
+    loss_func = PITLossWrapper(pairwise_neg_sisdr, pit_from="pw_mtx")
+    system = System(
         model=model,
         loss_func=loss_func,
         optimizer=optimizer,
@@ -64,7 +99,6 @@ def main(conf):
     gpus = -1 if torch.cuda.is_available() else None
     distributed_backend = "ddp" if torch.cuda.is_available() else None
 
-    # Train model
     trainer = pl.Trainer(
         max_epochs=conf["training"]["epochs"],
         callbacks=callbacks,
@@ -72,121 +106,21 @@ def main(conf):
         gpus=gpus,
         distributed_backend=distributed_backend,
         limit_train_batches=1.0,  # Useful for fast experiment
-        gradient_clip_val=200,
+        gradient_clip_val=5.0,
     )
     trainer.fit(system)
 
     best_k = {k: v.item() for k, v in checkpoint.best_k_models.items()}
     with open(os.path.join(exp_dir, "best_k_models.json"), "w") as f:
         json.dump(best_k, f, indent=0)
-    # Save last model for convenience
-    torch.save(system.model.state_dict(), os.path.join(exp_dir, "final_model.pth"))
 
+    state_dict = torch.load(checkpoint.best_model_path)
+    system.load_state_dict(state_dict=state_dict["state_dict"])
+    system.cpu()
 
-class ChimeraSystem(System):
-    def __init__(self, *args, mask_mixture=True, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.mask_mixture = mask_mixture
-
-    def common_step(self, batch, batch_nb, train=False):
-        inputs, targets, masks = self.unpack_data(batch)
-        embeddings, est_masks = self(inputs)
-        spec = mag(self.model.encoder(inputs.unsqueeze(1)))
-        if self.mask_mixture:
-            est_masks = est_masks * spec.unsqueeze(1)
-            masks = masks * spec.unsqueeze(1)
-        loss, loss_dic = self.loss_func(
-            embeddings, targets, est_src=est_masks, target_src=masks, mix_spec=spec
-        )
-        return loss, loss_dic
-
-    def training_step(self, batch, batch_nb):
-        loss, loss_dic = self.common_step(batch, batch_nb, train=True)
-        tensorboard_logs = dict(
-            train_loss=loss, train_dc_loss=loss_dic["dc_loss"], train_pit_loss=loss_dic["pit_loss"]
-        )
-        return {"loss": loss, "log": tensorboard_logs}
-
-    def validation_step(self, batch, batch_nb):
-        loss, loss_dic = self.common_step(batch, batch_nb, train=False)
-        tensorboard_logs = dict(
-            val_loss=loss, val_dc_loss=loss_dic["dc_loss"], val_pit_loss=loss_dic["pit_loss"]
-        )
-        return {"val_loss": loss, "log": tensorboard_logs}
-
-    def validation_end(self, outputs):
-        # Not so pretty for now but it helps.
-        avg_loss = torch.stack([x["val_loss"] for x in outputs]).mean()
-        avg_dc_loss = torch.stack([x["log"]["val_dc_loss"] for x in outputs]).mean()
-        avg_pit_loss = torch.stack([x["log"]["val_pit_loss"] for x in outputs]).mean()
-        tensorboard_logs = dict(
-            val_loss=avg_loss, val_dc_loss=avg_dc_loss, val_pit_loss=avg_pit_loss
-        )
-        return {
-            "val_loss": avg_loss,
-            "log": tensorboard_logs,
-            "progress_bar": {"val_loss": avg_loss},
-        }
-
-    def unpack_data(self, batch, EPS=1e-8):
-        mix, sources = batch
-        # Compute magnitude spectrograms and IRM
-        src_mag_spec = mag(self.model.encoder(sources))
-        real_mask = src_mag_spec / (src_mag_spec.sum(1, keepdim=True) + EPS)
-        # Get the src idx having the maximum energy
-        binary_mask = real_mask.argmax(1)
-        return mix, binary_mask, real_mask
-
-
-class ChimeraLoss(nn.Module):
-    """Combines Deep clustering loss and mask inference loss for ChimeraNet.
-
-    Args:
-        alpha (float): loss weight. Total loss will be :
-            `alpha` * dc_loss + (1 - `alpha`) * mask_mse_loss.
-    """
-
-    def __init__(self, alpha=0.1):
-        super().__init__()
-        assert alpha >= 0, "Negative alpha values don't make sense."
-        assert alpha <= 1, "Alpha values above 1 don't make sense."
-        # PIT loss
-        self.src_mse = PITLossWrapper(pairwise_mse, pit_from="pw_mtx")
-        self.alpha = alpha
-
-    def forward(self, est_embeddings, target_indices, est_src=None, target_src=None, mix_spec=None):
-        """
-
-        Args:
-            est_embeddings (torch.Tensor): Estimated embedding from the DC head.
-            target_indices (torch.Tensor): Target indices that'll be passed to
-                the DC loss.
-            est_src (torch.Tensor): Estimated magnitude spectrograms (or masks).
-            target_src (torch.Tensor): Target magnitude spectrograms (or masks).
-            mix_spec (torch.Tensor): The magnitude spectrogram of the mixture
-                from which VAD will be computed. If None, no VAD is used.
-
-        Returns:
-            torch.Tensor, the total loss, averaged over the batch.
-            dict with `dc_loss` and `pit_loss` keys, unweighted losses.
-        """
-        if self.alpha != 0 and (est_src is None or target_src is None):
-            raise ValueError(
-                "Expected target and estimated spectrograms to " "compute the PIT loss, found None."
-            )
-        binary_mask = None
-        if mix_spec is not None:
-            binary_mask = ebased_vad(mix_spec)
-        # Dc loss is already divided by VAD in the loss function.
-        dc_loss = deep_clustering_loss(
-            embedding=est_embeddings, tgt_index=target_indices, binary_mask=binary_mask
-        )
-        src_pit_loss = self.src_mse(est_src, target_src)
-        # Equation (4) from Chimera paper.
-        tot = self.alpha * dc_loss.mean() + (1 - self.alpha) * src_pit_loss
-        # Return unweighted losses as well for logging.
-        loss_dict = dict(dc_loss=dc_loss.mean(), pit_loss=src_pit_loss)
-        return tot, loss_dict
+    to_save = system.model.serialize()
+    to_save.update(train_set.get_infos())
+    torch.save(to_save, os.path.join(exp_dir, "best_model.pth"))
 
 
 if __name__ == "__main__":
@@ -194,9 +128,18 @@ if __name__ == "__main__":
     from pprint import pprint
     from asteroid.utils import prepare_parser_from_dict, parse_args_as_dict
 
+    # We start with opening the config file conf.yml as a dictionary from
+    # which we can create parsers. Each top level key in the dictionary defined
+    # by the YAML file creates a group in the parser.
     with open("local/conf.yml") as f:
         def_conf = yaml.safe_load(f)
     parser = prepare_parser_from_dict(def_conf, parser=parser)
+    # Arguments are then parsed into a hierarchical dictionary (instead of
+    # flat, as returned by argparse) to facilitate calls to the different
+    # asteroid methods (see in main).
+    # plain_args is the direct output of parser.parse_args() and contains all
+    # the attributes in an non-hierarchical structure. It can be useful to also
+    # have it so we included it here but it is not used.
     arg_dic, plain_args = parse_args_as_dict(parser, return_plain_args=True)
     pprint(arg_dic)
     main(arg_dic)

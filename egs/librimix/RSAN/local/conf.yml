@@ -1,33 +1,25 @@
 # Filterbank config
 filterbank:
-  n_filters: 256
-  kernel_size: 256
-  stride: 64
-# Network config
+  stft_n_filters: 512
+  stft_kernel_size: 400
+  stft_stride: 100
 masknet:
-  rnn_type: lstm
-  n_layers: 4
-  hidden_size: 600
-  dropout: 0.3
-  embedding_dim: 40
-  take_log: y
-# Training config
+  architecture: DCCRN-CL
+data:
+  task: enh_single
+  train_dir: data/wav16k/max/train-360
+  valid_dir: data/wav16k/max/dev
+  sample_rate: 16000
+  n_src: 1
+  segment: 4
 training:
   epochs: 200
-  batch_size: 32
-  num_workers: 8
+  batch_size: 12
+  num_workers: 4
   half_lr: yes
   early_stop: yes
-  loss_alpha: 1.0  # DC loss weight : 1.0 => DC, <1.0 => Chimera
-# Optim config
+  gradient_clipping: 5
 optim:
-  optimizer: rmsprop
-  lr: 0.0001
-  weight_decay: 0.00000
-#  momentum: 0.9
-# Data config
-data:
-  train_dir: data/wav8k/min/tr/
-  valid_dir: data/wav8k/min/cv/
-  n_src: 2
-  sample_rate: 8000
+  optimizer: adam
+  lr: 0.001
+  weight_decay: !!float 1e-5
