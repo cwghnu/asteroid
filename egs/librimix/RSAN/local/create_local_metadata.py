@@ -15,6 +15,16 @@ def main(args):
     create_local_metadata(librimix_dir)
 
 
+def MergeEnvFile(newfile, oldfile):
+    with open(newfile, "a") as new_file, open(oldfile, "r") as old_file:
+        old_file_lines = old_file.readlines()
+        for idx, line in enumerate(old_file_lines):
+            if idx == 0:
+                continue
+            new_file.write(line.strip())
+            new_file.write("\n")
+
+
 def create_local_metadata(librimix_dir):
 
     md_dirs = [f for f in glob(os.path.join(librimix_dir, "*/*/*")) if f.endswith("metadata")]
@@ -26,7 +36,12 @@ def create_local_metadata(librimix_dir):
                 "data", os.path.relpath(md_dir, librimix_dir), subset
             ).replace("/metadata", "")
             os.makedirs(local_path, exist_ok=True)
-            shutil.copy(os.path.join(md_dir, md_file), local_path)
+            print(local_path)
+            print(md_file)
+            if os.path.exists(local_path):
+                MergeEnvFile(os.path.join(local_path, md_file), os.path.join(md_dir, md_file))
+            else:
+                shutil.copy(os.path.join(md_dir, md_file), local_path)
 
 
 if __name__ == "__main__":

@@ -8,7 +8,7 @@ from torch.utils.data import DataLoader
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
 
-from asteroid.models import DCCRNet
+from asteroid.models import RSAN
 from asteroid.data import LibriMix
 from asteroid.engine.optimizers import make_optimizer
 from asteroid.engine.system import System
@@ -61,6 +61,9 @@ def main(conf):
     model = DCCRNet(
         **conf["filterbank"], **conf["masknet"], sample_rate=conf["data"]["sample_rate"]
     )
+
+    model = RSAN()
+
     optimizer = make_optimizer(model.parameters(), **conf["optim"])
     # Define scheduler
     scheduler = None
