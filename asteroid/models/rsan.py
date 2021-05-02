@@ -52,7 +52,7 @@ class IPDFeature(nn.Module):
 
         assert n_channel > 1
 
-        for idx in range(n_channel):
+        for idx in range(n_channel-1):
             if idx == 0:
                 ipd_index = "{},{}".format(idx + 1, 0)
             else:
@@ -87,15 +87,15 @@ class IPDFeature(nn.Module):
         if p.dim() == 3:
             p = p.unsqueeze(0)
         N, _, _, T = p.shape
-        pha_dif = p[:, self.index_l] - p[:, self.index_r]
+        pha_dif = p[:, self.index_l, ...] - p[:, self.index_r, ...]
         if self.cos:
             # N x M x F x T
-            ipd = th.cos(pha_dif)
+            ipd = torch.cos(pha_dif)
             if self.sin:
                 # N x M x 2F x T
-                ipd = th.cat([ipd, th.sin(pha_dif)], 2)
+                ipd = torch.cat([ipd, torch.sin(pha_dif)], 2)
         else:
-            ipd = th.fmod(pha_dif, 2 * math.pi) - math.pi
+            ipd = torch.fmod(pha_dif, 2 * math.pi) - math.pi
         # N x MF x T
         ipd = ipd.view(N, -1, T)
         # N x MF x T
@@ -192,15 +192,15 @@ class RSAN(nn.Module):
         dropout=0,
         bidirectional=True,
         spk_emb_dim=128,
-        block_size=80,
+        block_size=30,
     ):
         super().__init__()
 
         self.ipd_extractor = IPDFeature(n_channel)
 
         self.module = RSAN_module(
-            in_spat=nfft // 2 * (n_channel - 1),
-            n_bin=nfft // 2,
+            in_spat=(nfft // 2 + 1) * (n_channel - 1),
+            n_bin=nfft // 2 + 1,
             n_layers=n_layers,
             hidden_size=hidden_size,
             dropout=dropout,
@@ -296,8 +296,8 @@ class RSAN(nn.Module):
             else:
                 res_mask_all = torch.cat([res_mask_all, res_mask], axis=-1)
 
-        wav_spk = torch.zeros((N, len(list_spk_info), L))
-        spec_spk = torch.zeros((N, len(list_spk_info), F, T))
+        wav_spk = torch.zeros((N, len(list_spk_info), L)).cuda()
+        spec_spk = torch.zeros((N, len(list_spk_info), F, T)).cuda()
         for i_mask, mask in enumerate(list_spk_mask):
             spec_spk[:, i_mask, ...] = mask * spec
             out_wav = self.torch_istft(
